@@ -200,17 +200,19 @@ def evaluate_version(item, as_of, policy):
 
     evaluation = item.get("evaluation")
 
+    # No usable evaluation evidence at all
     if not isinstance(evaluation, dict):
         return ["MISSING_EVALUATION"]
 
-    # ------------------------------------------------
+    # ==================================================
     # Timestamp
-    # ------------------------------------------------
+    # ==================================================
 
     created = parse_time(evaluation.get("createdAt"))
 
     if created is None:
         codes.append("INVALID_TIMESTAMP")
+
     else:
         if created > as_of:
             codes.append("FUTURE_EVALUATION")
@@ -222,9 +224,9 @@ def evaluate_version(item, as_of, policy):
             if created < oldest:
                 codes.append("STALE_EVALUATION")
 
-    # ------------------------------------------------
-    # Artifact / dataset / schema lineage
-    # ------------------------------------------------
+    # ==================================================
+    # Immutable lineage
+    # ==================================================
 
     if evaluation.get("artifactDigest") != item.get("artifactDigest"):
         codes.append("ARTIFACT_MISMATCH")
@@ -235,58 +237,65 @@ def evaluate_version(item, as_of, policy):
     if evaluation.get("schemaDigest") != policy["schemaDigest"]:
         codes.append("SCHEMA_MISMATCH")
 
-    # ------------------------------------------------
+    # ==================================================
     # Accuracy
-    # ------------------------------------------------
+    # ==================================================
 
     accuracy = evaluation.get("accuracy")
 
     if not finite_number(accuracy):
         codes.append("NON_FINITE")
+
     else:
         accuracy = float(accuracy)
 
-        if not 0 <= accuracy <= 1:
+        if accuracy < 0 or accuracy > 1:
             codes.append("METRIC_RANGE")
+
         elif accuracy < float(policy["accuracyFloor"]):
             codes.append("ACCURACY_FLOOR")
 
-    # ------------------------------------------------
+    # ==================================================
     # Latency
-    # ------------------------------------------------
+    # ==================================================
 
     latency = evaluation.get("latencyMs")
 
     if not finite_number(latency):
         codes.append("NON_FINITE")
+
     else:
         latency = float(latency)
 
         if latency < 0:
             codes.append("METRIC_RANGE")
+
         elif latency > float(policy["maxLatencyMs"]):
             codes.append("LATENCY_LIMIT")
 
-    # ------------------------------------------------
+    # ==================================================
     # Size
-    # ------------------------------------------------
+    # ==================================================
 
     size = evaluation.get("sizeBytes")
 
     if not safe_nonnegative_int(size):
-        if isinstance(size, (float, int)) and not isinstance(size, bool):
-            if not finite_number(size):
-                codes.append("NON_FINITE")
-            else:
-                codes.append("METRIC_RANGE")
+
+        if (
+            isinstance(size, (int, float))
+            and not isinstance(size, bool)
+            and not math.isfinite(float(size))
+        ):
+            codes.append("NON_FINITE")
         else:
             codes.append("METRIC_RANGE")
+
     elif size > policy["maxSizeBytes"]:
         codes.append("SIZE_LIMIT")
 
-    # ------------------------------------------------
+    # ==================================================
     # Required slices
-    # ------------------------------------------------
+    # ==================================================
 
     slices = evaluation.get("slices")
 
@@ -301,14 +310,16 @@ def evaluate_version(item, as_of, policy):
 
         value = slices[name]
 
+        # Non-finite is NON_FINITE.
+        # Do NOT also emit SLICE_RANGE here.
         if not finite_number(value):
             codes.append("NON_FINITE")
-            codes.append(f"SLICE_RANGE:{name}")
             continue
 
         value = float(value)
 
-        if not 0 <= value <= 1:
+        # Finite but outside [0,1]
+        if value < 0 or value > 1:
             codes.append(f"SLICE_RANGE:{name}")
             continue
 
@@ -453,6 +464,16 @@ async def promote(data: dict = Body(...)):
     state_key = (
         policy["datasetDigest"],
         policy["schemaDigest"],
+        supplied_champion,
+        tuple(
+            sorted(
+                (
+                    item["version"],
+                    item.get("artifactDigest")
+                )
+                for item in valid_items
+            )
+        )
     )
 
     effective_champion = champion_aliases.get(
