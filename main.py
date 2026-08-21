@@ -373,11 +373,17 @@ async def promote(data: dict = Body(...)):
     failed = {}
     counts = {}
 
+    # Count every string version first
     for item in versions:
         if isinstance(item, dict):
-            v = item.get("version")
-            if isinstance(v, str):
-                counts[v] = counts.get(v, 0) + 1
+            version = item.get("version")
+
+            if isinstance(version, str):
+                counts[version] = counts.get(version, 0) + 1
+
+                # failedGates must contain every input version,
+                # including eligible versions with no failures.
+                failed.setdefault(version, [])
 
     valid_items = []
 
@@ -389,21 +395,30 @@ async def promote(data: dict = Body(...)):
             continue
 
         version = item.get("version")
-
         codes = []
 
+        # Noncanonical / invalid version
         if not valid_version(version):
             codes.append("INVALID_VERSION")
 
-        if isinstance(version, str) and counts.get(version, 0) > 1:
+        # Every occurrence of a duplicate is rejected
+        if (
+            isinstance(version, str)
+            and counts.get(version, 0) > 1
+        ):
             codes.append("DUPLICATE_VERSION")
 
-        if codes:
-            # failedGates must contain the input version.
-            key = version if isinstance(version, str) else f"@{index}"
-
+        if isinstance(version, str):
+            failed.setdefault(version, [])
+            failed[version].extend(codes)
+        else:
+            key = f"@{index}"
             failed.setdefault(key, [])
             failed[key].extend(codes)
+
+        # IMPORTANT:
+        # Invalid or duplicate versions must never reach lookup/evaluation.
+        if codes:
             continue
 
         valid_items.append(item)
@@ -467,16 +482,16 @@ async def promote(data: dict = Body(...)):
             policy
         )
 
-        if codes:
-            failed.setdefault(version, [])
-            failed[version].extend(codes)
-        else:
+        failed.setdefault(version, [])
+        failed[version].extend(codes)
+
+        if not codes:
             eligible.append(item)
 
     # Sort all failure codes.
     failed = {
-        k: sorted_codes(v)
-        for k, v in failed.items()
+        version: sorted_codes(codes)
+        for version, codes in failed.items()
     }
 
     # -----------------------------------------------
