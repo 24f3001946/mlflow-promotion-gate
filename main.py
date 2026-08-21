@@ -286,18 +286,25 @@ def evaluate_version(item, as_of, policy):
         elif latency > float(policy["maxLatencyMs"]):
             codes.append("LATENCY_LIMIT")
 
-    # -----------------------------------------------
+    # ==================================================
     # Size
-    # -----------------------------------------------
+    # ==================================================
 
     size = evaluation.get("sizeBytes")
 
-    if isinstance(size, bool):
-        codes.append("METRIC_RANGE")
-
-    elif isinstance(size, float) and not math.isfinite(size):
+    # Missing / bool / string / other non-number
+    if (
+        size is None
+        or isinstance(size, bool)
+        or not isinstance(size, (int, float))
+    ):
         codes.append("NON_FINITE")
 
+    # NaN / +/- Infinity
+    elif not math.isfinite(float(size)):
+        codes.append("NON_FINITE")
+
+    # Must be an integer safe value
     elif not isinstance(size, int):
         codes.append("METRIC_RANGE")
 
@@ -491,11 +498,27 @@ async def promote(data: dict = Body(...)):
     }
 
     # -----------------------------------------------
+    # Rank ALL eligible versions first
+    # -----------------------------------------------
+
+    eligible.sort(
+        key=lambda item: (
+            -float(item["evaluation"]["accuracy"]),
+            float(item["evaluation"]["latencyMs"]),
+            int(item["evaluation"]["sizeBytes"]),
+            int(item["version"]),
+        )
+    )
+
+    eligible_versions = [
+        item["version"]
+        for item in eligible
+    ]
+
+    # -----------------------------------------------
     # Champion / alias state
     # -----------------------------------------------
 
-    # If this request previously promoted the alias,
-    # recognize the promoted champion on replay.
     state_key = (
         policy["datasetDigest"],
         policy["schemaDigest"],
@@ -516,29 +539,8 @@ async def promote(data: dict = Body(...)):
         supplied_champion
     )
 
-    # The supplied champion must identify a listed version
-    # unless a previous promotion has established the alias.
+    # Champion must identify a valid listed version
     if effective_champion not in lookup:
-        return {
-            "action": "block",
-            "championVersion": effective_champion,
-            "selectedVersion": None,
-            "eligibleVersions": sorted(
-                [x["version"] for x in eligible],
-                key=lambda x: int(x)
-            ),
-            "failedGates": failed,
-            "aliasMutation": None,
-            "evidence": None,
-        }
-
-    # Champion evidence must itself be eligible.
-    eligible_version_set = {
-        item["version"]
-        for item in eligible
-    }
-
-    if effective_champion not in eligible_version_set:
         return {
             "action": "block",
             "championVersion": effective_champion,
@@ -546,34 +548,12 @@ async def promote(data: dict = Body(...)):
             "eligibleVersions": eligible_versions,
             "failedGates": failed,
             "aliasMutation": None,
-            "evidence": None
+            "evidence": None,
         }
-
-    # -----------------------------------------------
-    # Rank eligible versions exactly as specified:
-    # accuracy DESC
-    # latency ASC
-    # size ASC
-    # numeric version ASC
-    # -----------------------------------------------
-
-    eligible.sort(
-        key=lambda item: (
-            -float(item["evaluation"]["accuracy"]),
-            float(item["evaluation"]["latencyMs"]),
-            int(item["evaluation"]["sizeBytes"]),
-            int(item["version"]),
-        )
-    )
-
-    eligible_versions = [
-        item["version"]
-        for item in eligible
-    ]
 
     eligible_set = set(eligible_versions)
 
-    # Champion must itself have valid evidence
+    # Champion evidence itself must pass all gates
     if effective_champion not in eligible_set:
         return {
             "action": "block",
@@ -587,53 +567,8 @@ async def promote(data: dict = Body(...)):
 
     champion = lookup[effective_champion]
 
-    # Highest ranked eligible NON-CHAMPION is the challenger.
-    challengers = [
-        item for item in eligible
-        if item["version"] != effective_champion
-    ]
-
-    challenger = challengers[0] if challengers else None
-
-    # -----------------------------------------------
-    # Replay after alias mutation
-    # -----------------------------------------------
-
-    if effective_champion != supplied_champion:
-        return {
-            "action": "retain",
-            "championVersion": effective_champion,
-            "selectedVersion": effective_champion,
-            "eligibleVersions": eligible_versions,
-            "failedGates": failed,
-            "aliasMutation": None,
-            "evidence": copy.deepcopy(
-                champion["evaluation"]
-            ),
-        }
-
-
-    # -----------------------------------------------
-    # No challenger -> retain champion
-    # -----------------------------------------------
-
-    if challenger is None:
-        return {
-            "action": "retain",
-            "championVersion": effective_champion,
-            "selectedVersion": effective_champion,
-            "eligibleVersions": eligible_versions,
-            "failedGates": failed,
-            "aliasMutation": None,
-            "evidence": copy.deepcopy(
-                champion["evaluation"]
-            ),
-        }
-
-
-    # -----------------------------------------------
-    # Challenger improvement
-    # -----------------------------------------------
+    # Highest ranked eligible model
+    challenger = eligible[0]
 
     improvement = round(
         float(challenger["evaluation"]["accuracy"])
@@ -641,8 +576,14 @@ async def promote(data: dict = Body(...)):
         12
     )
 
-    if improvement >= float(policy["minImprovement"]):
+    # -----------------------------------------------
+    # Promote only a DIFFERENT version
+    # -----------------------------------------------
 
+    if (
+        challenger["version"] != effective_champion
+        and improvement >= float(policy["minImprovement"])
+    ):
         champion_aliases[state_key] = challenger["version"]
 
         return {
@@ -660,8 +601,10 @@ async def promote(data: dict = Body(...)):
             ),
         }
 
+    # -----------------------------------------------
+    # Otherwise retain champion
+    # -----------------------------------------------
 
-    # Not enough improvement
     return {
         "action": "retain",
         "championVersion": effective_champion,
