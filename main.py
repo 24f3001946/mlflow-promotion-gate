@@ -200,7 +200,6 @@ def evaluate_version(item, as_of, policy):
 
     evaluation = item.get("evaluation")
 
-    # No usable evaluation evidence at all
     if not isinstance(evaluation, dict):
         return ["MISSING_EVALUATION"]
 
@@ -208,33 +207,51 @@ def evaluate_version(item, as_of, policy):
     # Timestamp
     # ==================================================
 
-    created = parse_time(evaluation.get("createdAt"))
+    created_raw = evaluation.get("createdAt")
+    created = parse_time(created_raw)
 
     if created is None:
         codes.append("INVALID_TIMESTAMP")
-
     else:
         if created > as_of:
             codes.append("FUTURE_EVALUATION")
-        else:
-            oldest = as_of - timedelta(
-                seconds=policy["maxAgeSeconds"]
-            )
 
-            if created < oldest:
-                codes.append("STALE_EVALUATION")
+        oldest = as_of - timedelta(
+            seconds=policy["maxAgeSeconds"]
+        )
+
+        if created < oldest:
+            codes.append("STALE_EVALUATION")
 
     # ==================================================
-    # Immutable lineage
+    # Immutable evidence / lineage
     # ==================================================
 
-    if evaluation.get("artifactDigest") != item.get("artifactDigest"):
+    registered_artifact = item.get("artifactDigest")
+    evaluated_artifact = evaluation.get("artifactDigest")
+
+    # Missing/non-string registered/evaluation artifact evidence
+    # cannot bind successfully.
+    if (
+        not isinstance(registered_artifact, str)
+        or registered_artifact == ""
+        or not isinstance(evaluated_artifact, str)
+        or evaluated_artifact != registered_artifact
+    ):
         codes.append("ARTIFACT_MISMATCH")
 
-    if evaluation.get("datasetDigest") != policy["datasetDigest"]:
+    if (
+        not isinstance(evaluation.get("datasetDigest"), str)
+        or evaluation.get("datasetDigest")
+        != policy["datasetDigest"]
+    ):
         codes.append("DATASET_MISMATCH")
 
-    if evaluation.get("schemaDigest") != policy["schemaDigest"]:
+    if (
+        not isinstance(evaluation.get("schemaDigest"), str)
+        or evaluation.get("schemaDigest")
+        != policy["schemaDigest"]
+    ):
         codes.append("SCHEMA_MISMATCH")
 
     # ==================================================
@@ -245,13 +262,11 @@ def evaluate_version(item, as_of, policy):
 
     if not finite_number(accuracy):
         codes.append("NON_FINITE")
-
     else:
         accuracy = float(accuracy)
 
         if accuracy < 0 or accuracy > 1:
             codes.append("METRIC_RANGE")
-
         elif accuracy < float(policy["accuracyFloor"]):
             codes.append("ACCURACY_FLOOR")
 
@@ -263,13 +278,11 @@ def evaluate_version(item, as_of, policy):
 
     if not finite_number(latency):
         codes.append("NON_FINITE")
-
     else:
         latency = float(latency)
 
         if latency < 0:
             codes.append("METRIC_RANGE")
-
         elif latency > float(policy["maxLatencyMs"]):
             codes.append("LATENCY_LIMIT")
 
@@ -279,16 +292,21 @@ def evaluate_version(item, as_of, policy):
 
     size = evaluation.get("sizeBytes")
 
-    if not safe_nonnegative_int(size):
+    # Missing / bool / non-number / NaN / Infinity
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, (int, float))
+        or not math.isfinite(float(size))
+    ):
+        codes.append("NON_FINITE")
 
-        if (
-            isinstance(size, (int, float))
-            and not isinstance(size, bool)
-            and not math.isfinite(float(size))
-        ):
-            codes.append("NON_FINITE")
-        else:
-            codes.append("METRIC_RANGE")
+    # Finite, but size must be a non-negative safe INTEGER
+    elif (
+        not isinstance(size, int)
+        or size < 0
+        or size > MAX_SAFE
+    ):
+        codes.append("METRIC_RANGE")
 
     elif size > policy["maxSizeBytes"]:
         codes.append("SIZE_LIMIT")
@@ -310,15 +328,12 @@ def evaluate_version(item, as_of, policy):
 
         value = slices[name]
 
-        # Non-finite is NON_FINITE.
-        # Do NOT also emit SLICE_RANGE here.
         if not finite_number(value):
             codes.append("NON_FINITE")
             continue
 
         value = float(value)
 
-        # Finite but outside [0,1]
         if value < 0 or value > 1:
             codes.append(f"SLICE_RANGE:{name}")
             continue
@@ -399,20 +414,29 @@ async def promote(data: dict = Body(...)):
 
     if as_of is None or not policy_valid:
 
-        for item in valid_items:
-            v = item["version"]
+        for index, item in enumerate(versions):
 
-            failed.setdefault(v, [])
+            if isinstance(item, dict):
+                version = item.get("version")
+            else:
+                version = None
+
+            if isinstance(version, str):
+                key = version
+            else:
+                key = f"@{index}"
+
+            failed.setdefault(key, [])
 
             if as_of is None:
-                failed[v].append("INVALID_TIMESTAMP")
+                failed[key].append("INVALID_TIMESTAMP")
 
             if not policy_valid:
-                failed[v].append("INVALID_POLICY")
+                failed[key].append("INVALID_POLICY")
 
         failed = {
-            k: sorted_codes(v)
-            for k, v in failed.items()
+            key: sorted_codes(codes)
+            for key, codes in failed.items()
         }
 
         return {
@@ -422,7 +446,7 @@ async def promote(data: dict = Body(...)):
             "eligibleVersions": [],
             "failedGates": failed,
             "aliasMutation": None,
-            "evidence": None,
+            "evidence": None
         }
 
     # -----------------------------------------------
@@ -498,34 +522,33 @@ async def promote(data: dict = Body(...)):
         }
 
     # Champion evidence must itself be eligible.
-    eligible_versions_set = {
-        x["version"] for x in eligible
+    eligible_version_set = {
+        item["version"]
+        for item in eligible
     }
 
-    if effective_champion not in eligible_versions_set:
+    if effective_champion not in eligible_version_set:
         return {
             "action": "block",
             "championVersion": effective_champion,
             "selectedVersion": None,
-            "eligibleVersions": sorted(
-                eligible_versions_set,
-                key=lambda x: int(x)
-            ),
+            "eligibleVersions": eligible_versions,
             "failedGates": failed,
             "aliasMutation": None,
-            "evidence": None,
+            "evidence": None
         }
 
     # -----------------------------------------------
     # Rank eligible versions
     # -----------------------------------------------
 
-    eligible.sort(
+    eligible = sorted(
+        eligible,
         key=lambda item: (
             -float(item["evaluation"]["accuracy"]),
             float(item["evaluation"]["latencyMs"]),
-            item["evaluation"]["sizeBytes"],
-            int(item["version"]),
+            int(item["evaluation"]["sizeBytes"]),
+            int(item["version"])
         )
     )
 
@@ -534,9 +557,18 @@ async def promote(data: dict = Body(...)):
         for item in eligible
     ]
 
-    best = eligible[0]
-
+    # Current champion
     champion = lookup[effective_champion]
+
+    # Highest-ranked eligible version
+    challenger = eligible[0]
+
+    # Improvement over current champion
+    improvement = round(
+        float(challenger["evaluation"]["accuracy"])
+        - float(champion["evaluation"]["accuracy"]),
+        12
+    ) 
 
     # -----------------------------------------------
     # Idempotent replay after promotion
@@ -561,30 +593,24 @@ async def promote(data: dict = Body(...)):
     # Promotion improvement
     # -----------------------------------------------
 
-    improvement = round(
-        float(best["evaluation"]["accuracy"])
-        - float(champion["evaluation"]["accuracy"]),
-        12
-    )
-
     if (
-        best["version"] != effective_champion
+        challenger["version"] != effective_champion
         and improvement >= float(policy["minImprovement"])
     ):
-        champion_aliases[state_key] = best["version"]
+        champion_aliases[state_key] = challenger["version"]
 
         return {
             "action": "promote",
             "championVersion": effective_champion,
-            "selectedVersion": best["version"],
+            "selectedVersion": challenger["version"],
             "eligibleVersions": eligible_versions,
             "failedGates": failed,
             "aliasMutation": {
                 "alias": "champion",
-                "version": best["version"],
+                "version": challenger["version"],
             },
             "evidence": copy.deepcopy(
-                best["evaluation"]
+                challenger["evaluation"]
             ),
         }
 
